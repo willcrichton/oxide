@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (libraries oxide)
+ (flags (:standard -w -8 -warn-error -A))
+ (preprocess (pps ppx_deriving.std)))
