@@ -1,5 +1,13 @@
 open Syntax
 
+val flow_closed_envs_forward : ty -> ty -> ty tc
+
+val type_of : prim -> ty
+
+val ty_valid_before_after : global_env -> tyvar_env -> ty -> var_env -> var_env -> unit tc
+
+val eval_env_of : var_env -> env -> env tc
+
 val valid_prov : tyvar_env -> var_env -> prov -> unit tc
 
 val valid_type :
