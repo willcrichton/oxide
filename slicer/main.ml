@@ -9,22 +9,25 @@ type node_id = int [@@deriving show]
 
 let opt_or_else o1 f = match o1 with Some _ -> o1 | None -> f ()
 
+let rec children (_, e) =
+  match e with
+  | Prim _ | Borrow _ -> []
+  | Let (_, _, e1, e2) -> [ e1; e2 ]
+  | Seq (e1, e2) -> [ e1; e2 ]
+  | Assign (_, e) -> [ e ]
+  | App (_, _, _, _, args) -> args
+  | Branch (e1, e2, e3) -> [ e1; e2; e3 ]
+  | _ -> raise (Failure (Format.sprintf "children: %s" (show_preexpr e)))
+
 let find_loc (l : source_loc) (e : expr) : preexpr =
-  let rec aux (l', e) =
+  let rec aux ((l', _) as e) =
     if l = l' then Some e
     else
-      match e with
-      | Prim _ | Borrow _ -> None
-      | Let (_, _, e1, e2) -> opt_or_else (aux e1) (fun _ -> aux e2)
-      | Seq (e1, e2) -> opt_or_else (aux e1) (fun _ -> aux e2)
-      | Assign (_, e) -> aux e
-      | App (_, _, _, _, args) ->
-        List.fold_left
-          (fun opt arg -> opt_or_else opt (fun _ -> aux arg))
-          None args
-      | _ -> raise (Failure (Format.sprintf "find_loc: %s" (show_preexpr e)))
+      List.fold_left
+        (fun opt arg -> opt_or_else opt (fun _ -> aux arg))
+        None (children e)
   in
-  aux e |> Option.get
+  aux e |> Option.get |> fun (_, e) -> e
 
 let fmt_owned (o : owned) : string =
   match o with Shared -> "shrd" | Unique -> "uniq"
@@ -65,6 +68,9 @@ let rec fmt_expr ((_, e) : expr) : string =
       (String.concat ", " (List.map fmt_expr args))
   | Move p -> fmt_place p
   | Fn f -> f
+  | Branch (e1, e2, e3) ->
+    Format.sprintf "if %s { %s } else { %s }" (fmt_expr e1) (fmt_expr e2)
+      (fmt_expr e3)
   | _ -> raise (Failure (Format.sprintf "fmt_expr: %s" (show_preexpr e)))
 
 module SliceEnv = struct
@@ -102,6 +108,13 @@ module SliceEnv = struct
     | Some (_, s') -> replace_assoc t p (list_union s s')
     | None -> (p, s) :: t
 
+  let minus (l : t) (r : t) : t =
+    List.map
+      (fun (p, s_l) ->
+        let s_r = lookup r (static, p) in
+        (p, List.filter (fun loc -> not (List.mem loc s_r)) s_l))
+      l
+
   let expr_deps (t : t) ((loc, e) : expr) : slice =
     let transitive =
       match e with
@@ -112,28 +125,11 @@ module SliceEnv = struct
     in
     uniq_cons loc transitive
 
-  (* let rec compute (t : t) ((_, e) as expr : expr) : t tc =
-     let* (_, gamma) = type_check t.sigma t.delta t.gamma expr in
-     let t = {t with gamma} in
-     match e with
-     | Prim _ | Borrow (_, _, _) -> Succ(t)
-     | Let (x, _tau, e1, e2) ->
-       let* t = compute t e1 in
-       let t = insert t (var x) (expr_deps t e1) in
-       compute t e2
-     | Seq (e1, e2) ->
-       let* t = compute t e1 in
-       compute t e2
-     | Assign (p, e) ->
-       let* t = compute t e in
-       let* loans = ownership_safe t.sigma t.delta t.gamma uniq p in
-       Format.printf "%a" pp_loans loans;
-       Succ(insert t p (expr_deps t e))
-     | _ -> raise (Failure (Format.sprintf "slice: %s" (show_preexpr e))) *)
+  let places (t : t) : preplace_expr list = List.map (fun (p, _) -> p) t
 end
 
 let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
-    (gamma : var_env) (expr : expr) : (ty * var_env * SliceEnv.t) tc =    
+    (gamma : var_env) (expr : expr) : (ty * var_env * SliceEnv.t) tc =
   let rec tc (slice_env : SliceEnv.t) (delta : tyvar_env) (gamma : var_env)
       (expr : expr) : (ty * var_env * SliceEnv.t) tc =
     (* Format.printf "tc: %s\n" (fmt_expr expr); *)
@@ -206,6 +202,29 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
       let still_used_provs = used_provs gamma1 in
       let* gamma1Prime = clear_unused_provenances still_used_provs gamma1 in
       tc slice_env1 delta gamma1Prime e2
+    (* T-Branch *)
+    | Branch (e1, e2, e3) -> (
+      match tc slice_env delta gamma e1 with
+      | Succ ((_, BaseTy Bool), gamma1, slice_env1) ->
+        let* ty2, gamma2, slice_env2 = tc slice_env1 delta gamma1 e2 in
+        let* ty3, gamma3, slice_env3 = tc slice_env2 delta gamma1 e3 in
+        let gammaPrime = union gamma2 gamma3 in
+        let* gammaFinal, tyFinal = unify (fst expr) delta gammaPrime ty2 ty3 in
+        let* () = valid_type sigma delta gammaFinal tyFinal in
+
+        let deps = SliceEnv.expr_deps slice_env3 e1 in
+        let slice_env3prime =
+          List.fold_left
+            (fun se p ->
+              let p = (static, p) in
+              SliceEnv.insert se p (list_union (SliceEnv.lookup se p) deps))
+            slice_env3
+            (SliceEnv.places (SliceEnv.minus slice_env3 slice_env1))
+        in
+
+        Succ (tyFinal, gammaFinal, slice_env3prime)
+      | Succ (found, _, _) -> TypeMismatch ((dummy, BaseTy Bool), found) |> fail
+      | Fail err -> Fail err )
     (* T-Let *)
     | Let (var, ann_ty, e1, e2) ->
       let* ty1, gamma1, slice_env1 = tc slice_env delta gamma e1 in
@@ -342,8 +361,7 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
           in
 
           (* Format.printf "before env: %s\n" (SliceEnv.fmt slice_env2);
-          Format.printf "args: `%s`\n" (String.concat ", " (List.map fmt_expr args)); *)
-
+             Format.printf "args: `%s`\n" (String.concat ", " (List.map fmt_expr args)); *)
           let slice_env3 =
             List.fold_left
               (fun acc tau ->
@@ -361,7 +379,6 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
           in
 
           (* Format.printf "after env: %s\n" (SliceEnv.fmt slice_env3); *)
-
           Succ (new_ret_ty, gammaPrime, slice_env3)
         | Some (expected, found) -> TypeMismatch (expected, found) |> fail )
       | Succ (((_, Uninit (_, Fun _)) as uninit_ty), _, _) ->
@@ -394,7 +411,7 @@ let main () =
     letexp x u32 (num 0)
     ((var x) <== num 1 >> 
     (letexp y (~&p1 uniq u32) (borrow p2 uniq (var x))   
-    (~*(var y) <== num 2 >> 
+    (cond (tru) (~*(var y) <== num 2) unit >> 
      app (~@ "foo") [] [p1] [] [move (var y)])))
     
     
