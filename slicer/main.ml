@@ -9,13 +9,13 @@ type node_id = int [@@deriving show]
 
 let opt_or_else o1 f = match o1 with Some _ -> o1 | None -> f ()
 
-let rec children (_, e) =
+let children (_, e) =
   match e with
-  | Prim _ | Borrow _ -> []
+  | Prim _ | Borrow _ | Move _ | Fn _ -> []
   | Let (_, _, e1, e2) -> [ e1; e2 ]
   | Seq (e1, e2) -> [ e1; e2 ]
   | Assign (_, e) -> [ e ]
-  | App (_, _, _, _, args) -> args
+  | App (e, _, _, _, args) -> e :: args
   | Branch (e1, e2, e3) -> [ e1; e2; e3 ]
   | _ -> raise (Failure (Format.sprintf "children: %s" (show_preexpr e)))
 
@@ -73,12 +73,28 @@ let rec fmt_expr ((_, e) : expr) : string =
       (fmt_expr e3)
   | _ -> raise (Failure (Format.sprintf "fmt_expr: %s" (show_preexpr e)))
 
+let global_expr = ref unit
+
+module Slice = struct
+  type t = source_loc list [@@deriving show]
+
+  let empty : t = []
+
+  let insert (t : t) ((l, _) : expr) : t = uniq_cons l t
+
+  let singleton (e : expr) : t = insert empty e
+
+  let union (t1 : t) (t2 : t) = list_union t1 t2
+
+  let contains (t : t) (l : source_loc) : bool = List.mem l t
+
+  let fmt (t : t) : string =
+    String.concat ", "
+      (List.map (fun loc -> fmt_expr (loc, find_loc loc !global_expr)) t)
+end
+
 module SliceEnv = struct
-  type slice = source_loc list [@@deriving show]
-
-  type t = (preplace_expr * slice) list [@@deriving show]
-
-  let global_expr = ref unit
+  type t = (preplace_expr * Slice.t) list [@@deriving show]
 
   let make (body : expr) : t =
     global_expr := body;
@@ -89,70 +105,74 @@ module SliceEnv = struct
       (String.concat ", "
          (List.map
             (fun (p, s) ->
-              let s =
-                String.concat ", "
-                  (List.map
-                     (fun loc -> fmt_expr (loc, find_loc loc !global_expr))
-                     s)
-              in
-              Format.sprintf "%s: {%s}" (fmt_place (static, p)) s)
+              Format.sprintf "%s: {%s}" (fmt_place (static, p)) (Slice.fmt s))
             t))
 
-  let lookup (t : t) ((_, p) : place_expr) : slice =
+  let lookup (t : t) ((_, p) : place_expr) : Slice.t =
     List.find_opt (fun (p', _) -> p = p') t
     |> Option.map (fun (_, slice) -> slice)
     |> Option.value ~default:[]
 
-  let insert (t : t) ((_, p) : place_expr) (s : slice) : t =
+  let insert (t : t) ((_, p) : place_expr) (s : Slice.t) : t =
     match List.find_opt (fun (p', _) -> p = p') t with
-    | Some (_, s') -> replace_assoc t p (list_union s s')
+    | Some (_, s') -> replace_assoc t p (Slice.union s s')
     | None -> (p, s) :: t
 
   let minus (l : t) (r : t) : t =
     List.map
       (fun (p, s_l) ->
         let s_r = lookup r (static, p) in
-        (p, List.filter (fun loc -> not (List.mem loc s_r)) s_l))
+        (p, List.filter (fun loc -> not (Slice.contains s_r loc)) s_l))
       l
 
-  let expr_deps (t : t) ((loc, e) : expr) : slice =
-    let transitive =
-      match e with
-      | Prim _ -> []
-      | Move p -> lookup t p
-      | Borrow (_, _, p) -> lookup t p
-      | _ -> raise (Failure (Format.sprintf "expr_deps: %s" (show_preexpr e)))
-    in
-    uniq_cons loc transitive
+  let union (t1 : t) (t2 : t) =
+    List.fold_left
+      (fun t (p, s) ->
+        insert t (static, p) (Slice.union s (lookup t (static, p))))
+      t1 t2
+
+  (* let expr_deps (t : t) ((loc, e) : expr) : Slice.t =
+     let transitive =
+       match e with
+       | Prim _ -> []
+       | Move p -> lookup t p
+       | Borrow (_, _, p) -> lookup t p
+       | _ -> raise (Failure (Format.sprintf "expr_deps: %s" (show_preexpr e)))
+     in
+     uniq_cons loc transitive *)
 
   let places (t : t) : preplace_expr list = List.map (fun (p, _) -> p) t
 end
 
+let loc (l, _) = l
+
 let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
-    (gamma : var_env) (expr : expr) : (ty * var_env * SliceEnv.t) tc =
+    (gamma : var_env) (expr : expr) : (ty * var_env * SliceEnv.t * Slice.t) tc =
   let rec tc (slice_env : SliceEnv.t) (delta : tyvar_env) (gamma : var_env)
-      (expr : expr) : (ty * var_env * SliceEnv.t) tc =
+      (expr : expr) : (ty * var_env * SliceEnv.t * Slice.t) tc =
     (* Format.printf "tc: %s\n" (fmt_expr expr); *)
     match snd expr with
     (* T-Unit, T-u32, T-True, T-False *)
-    | Prim prim -> Succ (type_of prim, gamma, slice_env)
+    | Prim prim -> Succ (type_of prim, gamma, slice_env, Slice.singleton expr)
     (* binary operations *)
     | BinOp (op, e1, e2) -> (
       match binop_to_types op with
       | Some lhs_ty, Some rhs_ty, out_ty ->
-        let* t1, gamma1, slice_env1 = tc slice_env delta gamma e1 in
+        let* t1, gamma1, slice_env1, slice1 = tc slice_env delta gamma e1 in
         if ty_eq t1 lhs_ty then
-          let* t2, gamma2, slice_env2 = tc slice_env1 delta gamma1 e2 in
+          let* t2, gamma2, slice_env2, slice2 = tc slice_env1 delta gamma1 e2 in
           if ty_eq t2 rhs_ty then
             let* gammaFinal, _ = unify (fst expr) delta gamma2 t1 t2 in
-            Succ (out_ty, gammaFinal, slice_env2)
+            let slice3 = Slice.insert (Slice.union slice1 slice2) expr in
+            Succ (out_ty, gammaFinal, slice_env2, slice3)
           else TypeMismatch (rhs_ty, t2) |> fail
         else TypeMismatch (lhs_ty, t1) |> fail
       | None, None, out_ty ->
-        let* t1, gamma1, slice_env1 = tc slice_env delta gamma e1 in
-        let* t2, gamma2, slice_env2 = tc slice_env1 delta gamma1 e2 in
+        let* t1, gamma1, slice_env1, slice1 = tc slice_env delta gamma e1 in
+        let* t2, gamma2, slice_env2, slice2 = tc slice_env1 delta gamma1 e2 in
         let* gammaFinal, _ = unify (fst expr) delta gamma2 t1 t2 in
-        Succ (out_ty, gammaFinal, slice_env2)
+        let slice3 = Slice.insert (Slice.union slice1 slice2) expr in
+        Succ (out_ty, gammaFinal, slice_env2, slice3)
       | _ -> failwith "T-BinOp: unreachable" )
     (* T-Move and T-Copy *)
     | Move phi -> (
@@ -164,6 +184,7 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
         (* but we recompute the type with the right context to do permissions checking *)
       in
       let* ty = compute_ty_in omega delta gamma phi in
+      let slice = Slice.insert (SliceEnv.lookup slice_env phi) expr in
       match ownership_safe sigma delta gamma omega phi with
       | Succ [ (Unique, pi) ] ->
         let* gammaPrime =
@@ -180,9 +201,15 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
             let* copy = copyable sigma ty in
             if copy then Succ gamma else failwith "T-Move: unreachable"
         in
-        Succ (ty, gammaPrime, slice_env)
-      | Succ _ ->
-        if copy then Succ (ty, gamma, slice_env)
+        Succ (ty, gammaPrime, slice_env, slice)
+      | Succ loans ->
+        let slice' =
+          List.fold_left
+            (fun slice' (_, phi) ->
+              Slice.union slice' (SliceEnv.lookup slice_env phi))
+            slice loans
+        in
+        if copy then Succ (ty, gamma, slice_env, slice')
         else failwith "T-Copy: unreachable"
       | Fail err -> Fail err )
     (* T-Borrow *)
@@ -195,39 +222,34 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
         CannotBorrowIntoInUseProvenance prov |> fail
       else
         let* updated_gamma = loan_env_prov_update prov loans gamma in
-        Succ ((inferred, Ref (prov, omega, ty)), updated_gamma, slice_env)
+        let slice = Slice.insert (SliceEnv.lookup slice_env pi) expr in
+        Succ ((inferred, Ref (prov, omega, ty)), updated_gamma, slice_env, slice)
       (* T-Seq *)
     | Seq (e1, e2) ->
-      let* _, gamma1, slice_env1 = tc slice_env delta gamma e1 in
+      let* _, gamma1, slice_env1, _ = tc slice_env delta gamma e1 in
       let still_used_provs = used_provs gamma1 in
       let* gamma1Prime = clear_unused_provenances still_used_provs gamma1 in
       tc slice_env1 delta gamma1Prime e2
     (* T-Branch *)
     | Branch (e1, e2, e3) -> (
       match tc slice_env delta gamma e1 with
-      | Succ ((_, BaseTy Bool), gamma1, slice_env1) ->
-        let* ty2, gamma2, slice_env2 = tc slice_env1 delta gamma1 e2 in
-        let* ty3, gamma3, slice_env3 = tc slice_env2 delta gamma1 e3 in
+      | Succ ((_, BaseTy Bool), gamma1, slice_env1, slice1) ->
+        let* ty2, gamma2, slice_env2, slice2 = tc slice_env1 delta gamma1 e2 in
+        let* ty3, gamma3, slice_env3, slice3 = tc slice_env1 delta gamma1 e3 in
         let gammaPrime = union gamma2 gamma3 in
         let* gammaFinal, tyFinal = unify (fst expr) delta gammaPrime ty2 ty3 in
         let* () = valid_type sigma delta gammaFinal tyFinal in
 
-        let deps = SliceEnv.expr_deps slice_env3 e1 in
-        let slice_env3prime =
-          List.fold_left
-            (fun se p ->
-              let p = (static, p) in
-              SliceEnv.insert se p (list_union (SliceEnv.lookup se p) deps))
-            slice_env3
-            (SliceEnv.places (SliceEnv.minus slice_env3 slice_env1))
-        in
+        let slice_envPrime = SliceEnv.union slice_env2 slice_env3 in
+        let slicePrime = Slice.union slice1 (Slice.union slice2 slice3) in
 
-        Succ (tyFinal, gammaFinal, slice_env3prime)
-      | Succ (found, _, _) -> TypeMismatch ((dummy, BaseTy Bool), found) |> fail
+        Succ (tyFinal, gammaFinal, slice_envPrime, slicePrime)
+      | Succ (found, _, _, _) ->
+        TypeMismatch ((dummy, BaseTy Bool), found) |> fail
       | Fail err -> Fail err )
     (* T-Let *)
     | Let (var, ann_ty, e1, e2) ->
-      let* ty1, gamma1, slice_env1 = tc slice_env delta gamma e1 in
+      let* ty1, gamma1, slice_env1, slice1 = tc slice_env delta gamma e1 in
       let* () = valid_type sigma delta gamma1 ty1 in
       let* gamma1Prime = subtype Combine delta gamma1 ty1 ann_ty in
       let* ann_ty = flow_closed_envs_forward ty1 ann_ty in
@@ -235,10 +257,11 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
       let still_used = used_provs gamma1Prime in
       let* gamma1Prime = gamma1Prime |> clear_unused_provenances still_used in
       let slice_env1Prime =
-        SliceEnv.insert slice_env1 (Oxide.Edsl.var var)
-          (SliceEnv.expr_deps slice_env1 e1)
+        SliceEnv.insert slice_env1 (Oxide.Edsl.var var) slice1
       in
-      let* ty2, gamma2, slice_env2 = tc slice_env1Prime delta gamma1Prime e2 in
+      let* ty2, gamma2, slice_env2, slice2 =
+        tc slice_env1Prime delta gamma1Prime e2
+      in
       let* gamma2Prime = var |> var_to_place |> var_env_uninit gamma2 ty2 in
       let still_used =
         List.concat [ used_provs gamma2Prime; provs_used_in_ty ty2 ]
@@ -248,20 +271,19 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
       in
       let* () = ty_valid_before_after sigma delta ty2 gamma2 gamma2Prime in
 
-      Succ (ty2, gamma2Prime, slice_env2)
+      Succ (ty2, gamma2Prime, slice_env2, slice2)
     (* T-Assign and T-AssignDeref *)
     | Assign (phi, e) -> (
       let gamma = kill_loans_for phi gamma in
       let* loans = ownership_safe sigma delta gamma Unique phi in
       let* ty_old = compute_ty_in Unique delta gamma phi in
-      let* ty_update, gamma1, slice_env1 = tc slice_env delta gamma e in
+      let* ty_update, gamma1, slice_env1, slice1 = tc slice_env delta gamma e in
       let* gammaPrime = subtype Override delta gamma1 ty_update ty_old in
 
-      let deps = SliceEnv.expr_deps slice_env1 e in
       let mutated = phi :: List.map (fun (_, p) -> p) loans in
       let slice_env2 =
         List.fold_left
-          (fun acc p -> SliceEnv.insert acc p deps)
+          (fun acc p -> SliceEnv.insert acc p slice1)
           slice_env1 mutated
       in
 
@@ -269,9 +291,10 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
       (* T-Assign *)
       | Some pi ->
         let* gammaPrime = gammaPrime |> var_env_type_update pi ty_update in
-        Succ ((inferred, BaseTy Unit), gammaPrime, slice_env2)
+        Succ ((inferred, BaseTy Unit), gammaPrime, slice_env2, Slice.empty)
       (* T-AssignDeref *)
-      | None -> Succ ((inferred, BaseTy Unit), gammaPrime, slice_env2)
+      | None ->
+        Succ ((inferred, BaseTy Unit), gammaPrime, slice_env2, Slice.empty)
       (* T-Function *) )
     | Fn fn -> (
       match global_env_find_fn sigma fn with
@@ -281,7 +304,7 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
             Fun (evs, provs, tyvars, List.map snd params, Env [], ret_ty, bounds)
           )
         in
-        Succ (fn_ty, gamma, slice_env)
+        Succ (fn_ty, gamma, slice_env, Slice.singleton expr)
       | None -> (
         match gamma |> stack_to_bindings |> List.assoc_opt fn with
         (* T-Move for a closure *)
@@ -292,12 +315,13 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
           | Succ [ (Unique, _) ] ->
             let* ty = compute_ty_in Unique delta gamma (fst expr, (fn, [])) in
             let* closure_copyable = copyable sigma ty in
-            if closure_copyable then Succ (ty, gamma, slice_env)
+            if closure_copyable then
+              Succ (ty, gamma, slice_env, Slice.singleton expr)
             else
               let* gammaPrime =
                 gamma |> var_env_type_update (fst expr, (fn, [])) (uninit ty)
               in
-              Succ (ty, gammaPrime, slice_env)
+              Succ (ty, gammaPrime, slice_env, Slice.singleton expr)
           | Succ _ -> failwith "T-Move as T-Function: unreachable"
           | Fail err -> Fail err )
         | Some ((_, Uninit (_, Fun _)) as uninit_fn_ty) ->
@@ -310,7 +334,7 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
             let* ty =
               compute_ty_in omega delta gamma (fst expr, (fn, [ Deref ]))
             in
-            Succ (ty, gamma, slice_env)
+            Succ (ty, gamma, slice_env, Slice.singleton expr)
           | Fail err -> Fail err )
         | Some ty -> TypeMismatchFunction ty |> fail
         | None -> UnknownFunction (fst expr, fn) |> fail (* T-App *) ) )
@@ -319,8 +343,9 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
       | Succ
           ( (_, Fun (evs, provs, tyvars, params, _, ret_ty, bounds)),
             gammaF,
-            slice_env1 ) -> (
-        let* arg_tys, gammaN, slice_env2 =
+            slice_env1,
+            slice1 ) -> (
+        let* arg_tys, gammaN, slice_envN, sliceN =
           tc_many slice_env1 delta gammaF args
         in
         let* evaled_envs = map (eval_env_of gammaF) envs in
@@ -348,6 +373,7 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
           let new_ret_ty = do_sub ret_ty in
           let* () = valid_type sigma delta gammaPrime new_ret_ty in
 
+          (* TODO *)
           let rec mut_provs (_, ty) =
             match ty with
             | Ref (rho, omega, ty) -> (
@@ -355,48 +381,60 @@ let type_check (slice_env : SliceEnv.t) (sigma : global_env) (delta : tyvar_env)
             | _ -> []
           in
 
-          let arg_deps =
-            List.map (SliceEnv.expr_deps slice_env2) args
-            |> List.fold_left list_union []
+          let all_mut_provs = List.map mut_provs arg_tys |> List.flatten in
+          let sliceNPrime =
+            List.fold_left
+              (fun slice rho ->
+                match loan_env_lookup_opt gammaPrime rho with
+                | Some loans ->
+                  List.fold_left
+                    (fun slice (_, p) ->
+                      Slice.union slice (SliceEnv.lookup slice_envN p))
+                    slice loans
+                | None -> slice)
+              (Slice.union slice1 sliceN)
+              all_mut_provs
           in
 
-          (* Format.printf "before env: %s\n" (SliceEnv.fmt slice_env2);
-             Format.printf "args: `%s`\n" (String.concat ", " (List.map fmt_expr args)); *)
-          let slice_env3 =
-            List.fold_left
-              (fun acc tau ->
-                List.fold_left
-                  (fun acc rho ->
-                    Option.value ~default:acc
-                      (Option.map
-                         (fun loans ->
-                           List.fold_left
-                             (fun acc (_, p) -> SliceEnv.insert acc p arg_deps)
-                             acc loans)
-                         (loan_env_lookup_opt gammaPrime rho)))
-                  acc (mut_provs tau))
-              slice_env2 arg_tys
+          let update_loan env (_, p) = SliceEnv.insert env p sliceNPrime in
+          let update_prov env rho =
+            match loan_env_lookup_opt gammaPrime rho with
+            | Some loans -> List.fold_left update_loan env loans
+            | None -> env
+          in
+          let slice_envNprime =
+            List.fold_left update_prov slice_envN all_mut_provs
           in
 
           (* Format.printf "after env: %s\n" (SliceEnv.fmt slice_env3); *)
-          Succ (new_ret_ty, gammaPrime, slice_env3)
+          Succ
+            ( new_ret_ty,
+              gammaPrime,
+              slice_envNprime,
+              Slice.insert sliceNPrime expr )
         | Some (expected, found) -> TypeMismatch (expected, found) |> fail )
-      | Succ (((_, Uninit (_, Fun _)) as uninit_ty), _, _) ->
+      | Succ (((_, Uninit (_, Fun _)) as uninit_ty), _, _, _) ->
         MovedFunction (fn, uninit_ty) |> fail
-      | Succ (found, _, _) -> TypeMismatchFunction found |> fail
+      | Succ (found, _, _, _) -> TypeMismatchFunction found |> fail
       | Fail err -> Fail err )
   and tc_many (slice_env : SliceEnv.t) (delta : tyvar_env) (gamma : var_env)
-      (exprs : expr list) : (ty list * var_env * SliceEnv.t) tc =
+      (exprs : expr list) : (ty list * var_env * SliceEnv.t * Slice.t) tc =
     let tc_next (e : expr)
-        ((curr_tys, curr_gamma, slice_env) : ty list * var_env * SliceEnv.t) =
-      let* ty, gammaPrime, slice_env1 = tc slice_env delta curr_gamma e in
-      Succ (List.cons ty curr_tys, gammaPrime, slice_env1)
+        ((curr_tys, curr_gamma, slice_env, slice) :
+          ty list * var_env * SliceEnv.t * Slice.t) =
+      let* ty, gammaPrime, slice_env1, slice1 =
+        tc slice_env delta curr_gamma e
+      in
+      Succ
+        (List.cons ty curr_tys, gammaPrime, slice_env1, Slice.union slice slice1)
     in
-    foldr tc_next exprs ([], gamma, slice_env)
+    foldr tc_next exprs ([], gamma, slice_env, Slice.empty)
   in
-  let* out_ty, out_gamma, out_slice_env = tc slice_env delta gamma expr in
+  let* out_ty, out_gamma, out_slice_env, out_slice =
+    tc slice_env delta gamma expr
+  in
   let* () = valid_type sigma delta out_gamma out_ty in
-  (out_ty, out_gamma, out_slice_env) |> succ
+  (out_ty, out_gamma, out_slice_env, out_slice) |> succ
 
 let main () =
   let foo =
@@ -412,12 +450,13 @@ let main () =
     ((var x) <== num 1 >> 
     (letexp y (~&p1 uniq u32) (borrow p2 uniq (var x))   
     (cond (tru) (~*(var y) <== num 2) unit >> 
+    (* (move ~*(var y))))) *)
      app (~@ "foo") [] [p1] [] [move (var y)])))
     
     
     [@ocamlformat "disable"]
   in
-  let main = fn "main" [] [] [] [] unit_ty [] body in
+  let main = fn "main" [] [] [] [] u32 [] body in
   let sigma = [ main; foo ] in
 
   let (FnDef (_, evs, provs, tyvars, params, _ret_ty, bounds, body)) = main in
@@ -448,10 +487,11 @@ let main () =
 
   (* let* _, gamma = type_check sigma delta gamma body in *)
   Format.printf "%s\n" (fmt_expr body);
-  let* _, _, slice_env =
+  let* _, _, slice_env, slice =
     type_check (SliceEnv.make body) sigma delta gamma body
   in
   Format.printf "%s\n" (SliceEnv.fmt slice_env);
+  Format.printf "%s\n" (Slice.fmt slice);
 
   (* Format.printf "Slice: %a@." SliceEnv.pp slice_env; *)
   Succ ()
